@@ -20,88 +20,171 @@
 
 use async_trait::async_trait;
 use http::{Response, StatusCode};
+use jsonwebtoken::jwk::Jwk;
+use jsonwebtoken::{decode, decode_header, DecodingKey, Validation};
 use pingora_core::apps::http_app::{HttpServer, ServeHttp};
 use pingora_core::protocols::http::ServerSession;
 use pingora_core::server::Server;
 use pingora_core::services::listening::Service;
 use reqwest::Client;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::env;
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 
-struct ClearGlassProxy {
-    introspect_url: String,
-    client_id: String,
-    client_secret: String,
-    http_client: Client,
-}
-
-fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .init();
-
-    let port = env::var("PORT").unwrap_or_else(|_| "8080".to_string());
-    let addr = format!("0.0.0.0:{port}");
-    info!("clearglass listening on {addr}");
-
-    let mut server = Server::new(None).expect("failed to create server");
-    server.bootstrap();
-
-    let app = HttpServer::new_app(ClearGlassProxy::from_env());
-    let mut service = Service::new("clearglass".to_string(), app);
-    service.add_tcp(&addr);
-    server.add_service(service);
-
-    server.run_forever();
-}
-
 #[derive(Deserialize)]
-struct IntrospectResponse {
-    active: bool,
-    #[serde(default)]
-    scope: String,
+struct Jwks {
+    keys: Vec<Jwk>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Claims {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    iss: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sub: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    aud: Option<serde_json::Value>, // can be string OR array in Keycloak
+    exp: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    iat: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    nbf: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    azp: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scope: Option<String>,
+}
+
+type Error = Box<dyn std::error::Error>;
+
+// ---------------------------------------------------------------------------
+// JwksClient — fetches public keys from a JWKS endpoint and caches them.
+// ---------------------------------------------------------------------------
+
+struct JwksClient {
+    jwks_url: String,
+    http_client: Client,
+    cache: Arc<RwLock<HashMap<String, DecodingKey>>>,
+}
+
+impl JwksClient {
+    fn new(jwks_url: String, http_client: Client) -> Self {
+        JwksClient {
+            jwks_url,
+            http_client,
+            cache: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    async fn decoding_key(&self, kid: &str) -> Result<DecodingKey, Error> {
+        {
+            let cache = self.cache.read().await;
+            if let Some(key) = cache.get(kid) {
+                debug!(kid = %kid, "using cached JWKS key");
+                return Ok(key.clone());
+            }
+        }
+
+        debug!(url = %self.jwks_url, "fetching JWKS");
+        let jwks: Jwks = match self.http_client.get(&self.jwks_url).send().await {
+            Ok(resp) => match resp.json().await {
+                Ok(jwks) => jwks,
+                Err(err) => {
+                    let msg = format!("failed to parse JWKS response: {}", err);
+                    error!(msg);
+                    return Err(Error::from(msg));
+                }
+            },
+            Err(err) => {
+                let msg = format!("failed to fetch JWKS: {}", err);
+                error!(msg);
+                return Err(Error::from(msg));
+            }
+        };
+
+        let jwk = match jwks
+            .keys
+            .iter()
+            .find(|k| k.common.key_id.as_deref() == Some(kid))
+        {
+            Some(key) => key,
+            None => {
+                let msg = format!("key not found in JWKS for kid: {}", kid);
+                warn!(msg);
+                return Err(Error::from(msg));
+            }
+        };
+
+        let decoding_key = match DecodingKey::from_jwk(jwk) {
+            Ok(key) => key,
+            Err(err) => {
+                let msg = format!("failed to create DecodingKey from JWK: {}", err);
+                error!(msg);
+                return Err(Error::from(msg));
+            }
+        };
+
+        {
+            let mut cache = self.cache.write().await;
+            cache.insert(kid.to_string(), decoding_key.clone());
+        }
+
+        debug!(kid = %kid, "cached new JWKS key");
+        Ok(decoding_key)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ClearGlassProxy — HTTP handler; validates Bearer tokens and checks scopes.
+// ---------------------------------------------------------------------------
+
+struct ClearGlassProxy {
+    jwks: Arc<JwksClient>,
 }
 
 impl ClearGlassProxy {
     fn from_env() -> Self {
+        let http_client = Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("failed to build HTTP client");
         ClearGlassProxy {
-            introspect_url: must_env("TOKEN_INTROSPECTION_URL"),
-            client_id: must_env("INTROSPECT_CLIENT_ID"),
-            client_secret: must_env("INTROSPECT_CLIENT_SECRET"),
-            http_client: Client::builder()
-                .timeout(Duration::from_secs(5))
-                .build()
-                .expect("failed to build HTTP client"),
+            jwks: Arc::new(JwksClient::new(must_env("JWKS_URL"), http_client)),
         }
     }
 
-    async fn introspect(&self, token: &str) -> Result<IntrospectResponse, reqwest::Error> {
-        debug!(url = %self.introspect_url, "calling token introspection endpoint");
-        let resp = self
-            .http_client
-            .post(&self.introspect_url)
-            .form(&[
-                ("token", token),
-                ("client_id", self.client_id.as_str()),
-                ("client_secret", self.client_secret.as_str()),
-            ])
-            .send()
-            .await?
-            .json::<IntrospectResponse>()
-            .await?;
-        debug!(active = resp.active, scopes = %resp.scope, "introspection response received");
-        Ok(resp)
+    /// Verifies the JWT and returns the space-separated scope string from the claims.
+    async fn validate(&self, token: &str) -> Result<String, Error> {
+        let header = decode_header(token)
+            .map_err(|e| Error::from(format!("failed to decode JWT header: {}", e)))?;
+
+        let kid = header.kid.ok_or_else(|| {
+            warn!("JWT header missing kid");
+            Error::from("JWT header missing 'kid' field")
+        })?;
+
+        let decoding_key = self.jwks.decoding_key(&kid).await?;
+
+        let mut validation = Validation::new(header.alg);
+        validation.validate_exp = true;
+        validation.validate_nbf = true;
+        validation.leeway = 10;
+        validation.validate_aud = false;
+
+        let token_data = decode::<Claims>(token, &decoding_key, &validation).map_err(|e| {
+            warn!("JWT verification failed");
+            Error::from(format!("failed to decode and verify JWT: {}", e))
+        })?;
+
+        Ok(token_data.claims.scope.unwrap_or_default())
     }
 
-    /// Handles the validation of a request's bearer token and its associated scopes.
-    /// The required scopes are specified in the `required_token_scopes` parameter in the format `?scope=value1&scope=value2&...`.
-    /// The auth header must start with "Bearer" and contain a valid JWT, the token itself must contain all
-    /// required scopes.
-    /// In addition, the token must pass the token introspection check.
     async fn handle_validate(
         &self,
         auth_header: Option<&str>,
@@ -119,18 +202,14 @@ impl ClearGlassProxy {
             }
         };
 
-        let result = match self.introspect(token).await {
-            Ok(r) => r,
+        let scope = match self.validate(token).await {
+            Ok(s) => s,
             Err(e) => {
-                error!(error = %e, "introspection request failed");
-                return text_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error");
+                let msg = format!("failed to validate token: {}", e);
+                error!(msg);
+                return text_response(StatusCode::UNAUTHORIZED, msg.as_str());
             }
         };
-
-        if !result.active {
-            warn!("request rejected: token inactive");
-            return text_response(StatusCode::UNAUTHORIZED, "token inactive");
-        }
 
         // ?scope= params are candidates; the token must carry at least one.
         let required: Vec<&str> = required_token_scopes
@@ -142,7 +221,7 @@ impl ClearGlassProxy {
             .collect();
 
         if !required.is_empty() {
-            let present: HashSet<&str> = result.scope.split_whitespace().collect();
+            let present: HashSet<&str> = scope.split_whitespace().collect();
             if !required.iter().any(|s| present.contains(s)) {
                 warn!(required = ?required, present = ?present, "request rejected: insufficient scope");
                 return text_response(StatusCode::FORBIDDEN, "insufficient scope");
@@ -183,6 +262,26 @@ impl ServeHttp for ClearGlassProxy {
     }
 }
 
+fn main() {
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env())
+        .init();
+
+    let port = env::var("PORT").unwrap_or_else(|_| "8080".to_string());
+    let addr = format!("0.0.0.0:{port}");
+    info!("clearglass listening on {addr}");
+
+    let mut server = Server::new(None).expect("failed to create server");
+    server.bootstrap();
+
+    let app = HttpServer::new_app(ClearGlassProxy::from_env());
+    let mut service = Service::new("clearglass".to_string(), app);
+    service.add_tcp(&addr);
+    server.add_service(service);
+
+    server.run_forever();
+}
+
 fn text_response(status: StatusCode, body: &str) -> Response<Vec<u8>> {
     Response::builder()
         .status(status)
@@ -201,153 +300,244 @@ fn must_env(key: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    use ed25519_dalek::pkcs8::EncodePrivateKey;
+    use ed25519_dalek::SigningKey;
+    use jsonwebtoken::{encode, EncodingKey, Header};
+    use std::sync::OnceLock;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    fn make_proxy(url: &str) -> ClearGlassProxy {
+    const TEST_KID: &str = "test-key-id";
+
+    struct Fixture {
+        encoding_key: EncodingKey,
+        decoding_key: DecodingKey,
+        jwks_json: String,
+    }
+
+    static FIXTURE: OnceLock<Fixture> = OnceLock::new();
+
+    fn fixture() -> &'static Fixture {
+        FIXTURE.get_or_init(|| {
+            let signing_key = SigningKey::from_bytes(&[42u8; 32]);
+
+            let priv_der = signing_key
+                .to_pkcs8_der()
+                .expect("Ed25519 PKCS8 DER encoding failed");
+            let encoding_key = EncodingKey::from_ed_der(priv_der.as_bytes());
+
+            let verifying_key = signing_key.verifying_key();
+            let x = URL_SAFE_NO_PAD.encode(verifying_key.as_bytes());
+
+            let jwk_json =
+                format!(r#"{{"kty":"OKP","crv":"Ed25519","kid":"{TEST_KID}","x":"{x}"}}"#);
+            let jwks_json = format!(r#"{{"keys":[{jwk_json}]}}"#);
+
+            let jwk: Jwk = serde_json::from_str(&jwk_json).expect("JWK parse failed");
+            let decoding_key = DecodingKey::from_jwk(&jwk).expect("DecodingKey build failed");
+
+            Fixture {
+                encoding_key,
+                decoding_key,
+                jwks_json,
+            }
+        })
+    }
+
+    fn make_jwt(scope: &str) -> String {
+        let mut header = Header::new(jsonwebtoken::Algorithm::EdDSA);
+        header.kid = Some(TEST_KID.to_string());
+
+        let exp = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600) as usize;
+
+        let claims = Claims {
+            iss: None,
+            sub: Some("test-subject".to_string()),
+            aud: None,
+            exp,
+            iat: None,
+            nbf: None,
+            azp: None,
+            scope: if scope.is_empty() {
+                None
+            } else {
+                Some(scope.to_string())
+            },
+        };
+
+        encode(&header, &claims, &fixture().encoding_key).expect("JWT encode failed")
+    }
+
+    /// Creates a proxy with a pre-seeded JWKS cache so no HTTP request is made.
+    fn make_proxy() -> ClearGlassProxy {
+        let mut cache = HashMap::new();
+        cache.insert(TEST_KID.to_string(), fixture().decoding_key.clone());
         ClearGlassProxy {
-            introspect_url: url.to_string(),
-            client_id: "test-client".to_string(),
-            client_secret: "test-secret".to_string(),
-            http_client: Client::builder()
-                .timeout(Duration::from_secs(2))
-                .build()
-                .unwrap(),
+            jwks: Arc::new(JwksClient {
+                jwks_url: "http://unused-in-cached-tests".to_string(),
+                http_client: Client::builder()
+                    .timeout(Duration::from_secs(2))
+                    .build()
+                    .unwrap(),
+                cache: Arc::new(RwLock::new(cache)),
+            }),
         }
     }
 
-    async fn setup_mock(active: bool, scope: &str) -> (MockServer, ClearGlassProxy) {
-        let server = MockServer::start().await;
-        let body = format!(r#"{{"active":{},"scope":"{}"}}"#, active, scope);
-        Mock::given(method("POST"))
-            .and(path("/introspect"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_string(body)
-                    .insert_header("content-type", "application/json"),
-            )
-            .mount(&server)
-            .await;
-        let proxy = make_proxy(&format!("{}/introspect", server.uri()));
-        (server, proxy)
+    fn bearer(token: &str) -> String {
+        format!("Bearer {token}")
     }
 
-    fn response_body(resp: &Response<Vec<u8>>) -> String {
+    fn body(resp: &Response<Vec<u8>>) -> String {
         String::from_utf8(resp.body().clone()).unwrap()
     }
 
-    // --- Token extraction ---
+    // --- Token extraction (rejected before JWT validation) ---
 
     #[tokio::test]
     async fn no_auth_header_returns_401() {
-        let (_, proxy) = setup_mock(true, "").await;
-        let resp = proxy.handle_validate(None, "").await;
+        let resp = make_proxy().handle_validate(None, "").await;
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-        assert_eq!(response_body(&resp), "missing bearer token");
+        assert_eq!(body(&resp), "missing bearer token");
     }
 
     #[tokio::test]
     async fn wrong_auth_scheme_returns_401() {
-        let (_, proxy) = setup_mock(true, "").await;
-        let resp = proxy.handle_validate(Some("Basic abc123"), "").await;
+        let resp = make_proxy().handle_validate(Some("Basic abc123"), "").await;
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-        assert_eq!(response_body(&resp), "missing bearer token");
+        assert_eq!(body(&resp), "missing bearer token");
     }
 
     #[tokio::test]
-    async fn empty_token_returns_401() {
-        let (_, proxy) = setup_mock(true, "").await;
-        let resp = proxy.handle_validate(Some("Bearer "), "").await;
+    async fn empty_bearer_returns_401() {
+        let resp = make_proxy().handle_validate(Some("Bearer "), "").await;
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-        assert_eq!(response_body(&resp), "invalid bearer token");
+        assert_eq!(body(&resp), "invalid bearer token");
     }
 
     #[tokio::test]
     async fn oversized_token_returns_401() {
-        let (_, proxy) = setup_mock(true, "").await;
-        let long_token = format!("Bearer {}", "x".repeat(4097));
-        let resp = proxy.handle_validate(Some(&long_token), "").await;
+        let tok = format!("Bearer {}", "x".repeat(4097));
+        let resp = make_proxy().handle_validate(Some(&tok), "").await;
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-        assert_eq!(response_body(&resp), "invalid bearer token");
+        assert_eq!(body(&resp), "invalid bearer token");
     }
 
+    // --- JWT validation ---
+
     #[tokio::test]
-    async fn max_length_token_is_accepted() {
-        let (_, proxy) = setup_mock(true, "").await;
-        let token = format!("Bearer {}", "x".repeat(4096));
-        let resp = proxy.handle_validate(Some(&token), "").await;
+    async fn valid_jwt_no_scope_required_returns_200() {
+        let tok = make_jwt("read");
+        let resp = make_proxy().handle_validate(Some(&bearer(&tok)), "").await;
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
-    // --- Introspection results ---
-
     #[tokio::test]
-    async fn inactive_token_returns_401() {
-        let (_, proxy) = setup_mock(false, "").await;
-        let resp = proxy.handle_validate(Some("Bearer valid-token"), "").await;
+    async fn malformed_jwt_returns_401() {
+        let resp = make_proxy()
+            .handle_validate(Some("Bearer not.a.jwt"), "")
+            .await;
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-        assert_eq!(response_body(&resp), "token inactive");
     }
 
     #[tokio::test]
-    async fn introspection_error_returns_500() {
-        // Point to a server that doesn't exist
-        let proxy = make_proxy("http://127.0.0.1:1/introspect");
-        let resp = proxy.handle_validate(Some("Bearer some-token"), "").await;
-        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
-        assert_eq!(response_body(&resp), "internal error");
+    async fn jwks_fetch_failure_returns_401() {
+        let proxy = ClearGlassProxy {
+            jwks: Arc::new(JwksClient::new(
+                "http://127.0.0.1:1/jwks".to_string(),
+                Client::builder()
+                    .timeout(Duration::from_secs(1))
+                    .build()
+                    .unwrap(),
+            )),
+        };
+        let tok = make_jwt("read");
+        let resp = proxy.handle_validate(Some(&bearer(&tok)), "").await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn jwks_endpoint_is_fetched_and_key_cached() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/jwks"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(fixture().jwks_json.clone())
+                    .insert_header("content-type", "application/json"),
+            )
+            .mount(&server)
+            .await;
+
+        let proxy = ClearGlassProxy {
+            jwks: Arc::new(JwksClient::new(
+                format!("{}/jwks", server.uri()),
+                Client::builder()
+                    .timeout(Duration::from_secs(2))
+                    .build()
+                    .unwrap(),
+            )),
+        };
+
+        let tok = make_jwt("read");
+        let resp = proxy.handle_validate(Some(&bearer(&tok)), "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Second call must hit the cache (wiremock only registered one match).
+        let tok2 = make_jwt("read");
+        let resp2 = proxy.handle_validate(Some(&bearer(&tok2)), "").await;
+        assert_eq!(resp2.status(), StatusCode::OK);
     }
 
     // --- Scope checking ---
 
     #[tokio::test]
-    async fn active_token_no_scope_required_returns_200() {
-        let (_, proxy) = setup_mock(true, "read write").await;
-        let resp = proxy.handle_validate(Some("Bearer tok"), "").await;
-        assert_eq!(resp.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn active_token_matching_scope_returns_200() {
-        let (_, proxy) = setup_mock(true, "read write").await;
-        let resp = proxy
-            .handle_validate(Some("Bearer tok"), "scope=read")
+    async fn token_with_matching_scope_returns_200() {
+        let tok = make_jwt("read write");
+        let resp = make_proxy()
+            .handle_validate(Some(&bearer(&tok)), "scope=read")
             .await;
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[tokio::test]
-    async fn active_token_one_of_multiple_scopes_matches_returns_200() {
-        let (_, proxy) = setup_mock(true, "write").await;
-        let resp = proxy
-            .handle_validate(Some("Bearer tok"), "scope=read&scope=write")
+    async fn token_satisfying_one_of_multiple_required_scopes_returns_200() {
+        let tok = make_jwt("write");
+        let resp = make_proxy()
+            .handle_validate(Some(&bearer(&tok)), "scope=read&scope=write")
             .await;
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[tokio::test]
-    async fn active_token_no_matching_scope_returns_403() {
-        let (_, proxy) = setup_mock(true, "read").await;
-        let resp = proxy
-            .handle_validate(Some("Bearer tok"), "scope=admin")
+    async fn token_missing_required_scope_returns_403() {
+        let tok = make_jwt("read");
+        let resp = make_proxy()
+            .handle_validate(Some(&bearer(&tok)), "scope=admin")
             .await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-        assert_eq!(response_body(&resp), "insufficient scope");
+        assert_eq!(body(&resp), "insufficient scope");
     }
 
     #[tokio::test]
-    async fn empty_scope_value_is_ignored() {
-        let (_, proxy) = setup_mock(true, "").await;
-        // no required scope, no scope in token
-        let resp = proxy.handle_validate(Some("Bearer tok"), "scope=").await;
+    async fn empty_scope_param_value_returns_403() {
+        let tok = make_jwt("");
+        let resp = make_proxy()
+            .handle_validate(Some(&bearer(&tok)), "scope=")
+            .await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]
     async fn non_scope_query_params_are_ignored() {
-        let (_, proxy) = setup_mock(true, "read").await;
-        let resp = proxy
-            .handle_validate(Some("Bearer tok"), "foo=bar&scope=read&baz=qux")
+        let tok = make_jwt("read");
+        let resp = make_proxy()
+            .handle_validate(Some(&bearer(&tok)), "foo=bar&scope=read&baz=qux")
             .await;
         assert_eq!(resp.status(), StatusCode::OK);
     }
@@ -358,7 +548,7 @@ mod tests {
     fn text_response_sets_status_and_body() {
         let resp = text_response(StatusCode::FORBIDDEN, "denied");
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-        assert_eq!(response_body(&resp), "denied");
+        assert_eq!(body(&resp), "denied");
         assert_eq!(resp.headers().get("content-type").unwrap(), "text/plain");
     }
 }
