@@ -1,0 +1,72 @@
+# Example route→scope map for clearglass (ROUTES_FILE).
+#
+# Rules are evaluated top to bottom; the first rule whose method and path match
+# decides, so order most-specific-first. `anyOf` names the narrowest sufficient
+# scope — wider tokens (api-level, wildcard resource, higher action) satisfy it
+# via implication (admin ⊇ write ⊇ read; `identity-api:read` and
+# `identity-api:*:read` cover `identity-api:<resource>:read`).
+#
+# Paths are matched against X-Forwarded-Uri (query string stripped):
+#   `*`  matches exactly one path segment
+#   `**` (final segment only) matches any remainder, including nothing
+#
+# NOTE: patterns below use the EXTERNAL gateway paths (before the gateway's
+# prefix rewrite). Verify against the actual X-Forwarded-Uri your Traefik
+# version sends (run clearglass in report-only mode and read the logs) before
+# enforcing.
+#
+# `default` applies when no rule matches: deny (recommended) or allow.
+
+default: deny
+routes:
+  # IdentityHub Identity API
+  - path: /api/identity/participants/*/credentials/**
+    methods: [GET]
+    anyOf: [identity-api:credentials:read]
+  - path: /api/identity/participants/*/credentials/**
+    methods: [POST]
+    anyOf: [identity-api:credentials:write]
+  - path: /api/identity/participants/**
+    methods: [GET]
+    anyOf: [identity-api:participants:read]
+  - path: /api/identity/participants/**
+    methods: [POST, PUT, DELETE]
+    anyOf: [identity-api:participants:write]
+
+  # Control plane Management API
+  - path: /api/management/**
+    methods: [GET]
+    anyOf: [management-api:read]
+  - path: /api/management/**
+    methods: [POST, PUT, PATCH, DELETE]
+    anyOf: [management-api:write]
+
+  # IssuerService Issuer Admin API
+  - path: /api/issuer/admin/**
+    methods: [GET]
+    anyOf: [issuer-admin-api:read]
+  - path: /api/issuer/admin/**
+    methods: [POST, PUT, DELETE]
+    anyOf: [issuer-admin-api:write]
+
+  # CFM Tenant Manager — POST .../query endpoints are reads, so they come first
+  - path: /api/tm/*/query
+    methods: [POST]
+    anyOf: [tenant-manager-api:read]
+  - path: /api/tm/**
+    methods: [GET]
+    anyOf: [tenant-manager-api:read]
+  - path: /api/tm/**
+    methods: [POST, PATCH, DELETE]
+    anyOf: [tenant-manager-api:write]
+
+  # CFM Provision Manager — same query-before-write ordering
+  - path: /api/pm/*/query
+    methods: [POST]
+    anyOf: [provision-manager-api:read]
+  - path: /api/pm/**
+    methods: [GET]
+    anyOf: [provision-manager-api:read]
+  - path: /api/pm/**
+    methods: [POST, DELETE]
+    anyOf: [provision-manager-api:write]
