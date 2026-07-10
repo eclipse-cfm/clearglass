@@ -22,5 +22,5 @@ serde_yaml_ng = "0.10"
 
 [dev-dependencies]
 wiremock = "0.6"
-ed25519-dalek = { version = "2", features = ["pkcs8"] }
+ed25519-dalek = { version = "3", features = ["pkcs8"] }
 base64 = "0.22"
