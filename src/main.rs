@@ -10,14 +10,26 @@
 //      Metaform Systems, Inc. - initial API and implementation
 
 // clearglass is a lightweight Traefik ForwardAuth target that validates
-// Bearer tokens via Keycloak's token introspection endpoint (RFC 7662)
-// and enforces per-route scope requirements.
+// Bearer tokens against the issuer's JWKS and enforces per-route scope
+// requirements.
 //
 // Traefik calls: GET /validate?scope=<s1>&scope=<s2>
-//   - 200 → token is active and has at least one of the listed scopes
-//   - 401 → missing/inactive token
+//   - 200 → token is valid and satisfies the scope requirements
+//   - 401 → missing/invalid token
 //   - 403 → token is valid but lacks the required scopes
+//
+// Scope requirements come from two sources:
+//   1. legacy `?scope=` query params on the middleware URL — the token must
+//      carry at least one of them verbatim
+//   2. a static route→scope map (ROUTES_FILE) evaluated against the
+//      X-Forwarded-Method / X-Forwarded-Uri headers Traefik sends. Until
+//      ENFORCE_ROUTES=true, map violations are only logged (report-only) and
+//      the legacy check alone decides.
 
+mod routes;
+mod scopes;
+
+use crate::routes::{Decision, RouteConfig};
 use async_trait::async_trait;
 use http::{Response, StatusCode};
 use jsonwebtoken::jwk::Jwk;
@@ -146,6 +158,8 @@ impl JwksClient {
 
 struct ClearGlassProxy {
     jwks: Arc<JwksClient>,
+    route_config: Option<RouteConfig>,
+    enforce_routes: bool,
 }
 
 impl ClearGlassProxy {
@@ -154,8 +168,40 @@ impl ClearGlassProxy {
             .timeout(Duration::from_secs(5))
             .build()
             .expect("failed to build HTTP client");
+
+        let route_config = match env::var("ROUTES_FILE") {
+            Ok(path) => match RouteConfig::load(&path) {
+                Ok(config) => {
+                    info!(path = %path, rules = config.routes.len(), "loaded route map");
+                    Some(config)
+                }
+                Err(err) => {
+                    eprintln!("failed to load routes file {path}: {err}");
+                    std::process::exit(1);
+                }
+            },
+            Err(_) => None,
+        };
+
+        let enforce_routes = env::var("ENFORCE_ROUTES")
+            .map(|v| v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if enforce_routes && route_config.is_none() {
+            eprintln!("ENFORCE_ROUTES=true requires ROUTES_FILE to be set");
+            std::process::exit(1);
+        }
+        match (&route_config, enforce_routes) {
+            (Some(_), true) => info!("route map enforcement: ENABLED"),
+            (Some(_), false) => {
+                info!("route map enforcement: report-only (set ENFORCE_ROUTES=true to enforce)")
+            }
+            (None, _) => warn!("no ROUTES_FILE configured; only legacy ?scope= checks apply"),
+        }
+
         ClearGlassProxy {
             jwks: Arc::new(JwksClient::new(must_env("JWKS_URL"), http_client)),
+            route_config,
+            enforce_routes,
         }
     }
 
@@ -189,6 +235,8 @@ impl ClearGlassProxy {
         &self,
         auth_header: Option<&str>,
         required_token_scopes: &str,
+        forwarded_method: Option<&str>,
+        forwarded_uri: Option<&str>,
     ) -> Response<Vec<u8>> {
         let token = match auth_header.and_then(|h| h.strip_prefix("Bearer ")) {
             Some(t) if !t.is_empty() && t.len() <= 4096 => t,
@@ -229,8 +277,63 @@ impl ClearGlassProxy {
             debug!(required = ?required, "scope check passed");
         }
 
+        if let Some(resp) = self.check_routes(&scope, forwarded_method, forwarded_uri) {
+            return resp;
+        }
+
         debug!("request allowed");
         text_response(StatusCode::OK, "ok")
+    }
+
+    /// Evaluates the route map, if configured. Returns a 403 response when the
+    /// request must be rejected; in report-only mode violations are logged and
+    /// `None` is returned.
+    fn check_routes(
+        &self,
+        token_scopes: &str,
+        forwarded_method: Option<&str>,
+        forwarded_uri: Option<&str>,
+    ) -> Option<Response<Vec<u8>>> {
+        let config = self.route_config.as_ref()?;
+
+        let deny = |log_only_msg: &str, response_body: &str| {
+            if self.enforce_routes {
+                Some(text_response(StatusCode::FORBIDDEN, response_body))
+            } else {
+                warn!("report-only: {log_only_msg} — request would be denied with ENFORCE_ROUTES=true");
+                None
+            }
+        };
+
+        let (Some(method), Some(uri)) = (forwarded_method, forwarded_uri) else {
+            warn!(method = ?forwarded_method, uri = ?forwarded_uri, "route check impossible: X-Forwarded-Method/X-Forwarded-Uri missing");
+            return deny(
+                "forwarded method/uri headers missing",
+                "missing forwarded request headers",
+            );
+        };
+        let path = uri.split('?').next().unwrap_or(uri);
+
+        match config.evaluate(method, path, token_scopes) {
+            Decision::Allow => {
+                debug!(method = %method, path = %path, "route check passed");
+                None
+            }
+            Decision::InsufficientScope {
+                rule_path,
+                required,
+            } => {
+                warn!(method = %method, path = %path, rule = %rule_path, required = ?required, presented = %token_scopes, "route check failed: insufficient scope");
+                deny(
+                    "insufficient scope for matched route",
+                    "insufficient scope for route",
+                )
+            }
+            Decision::NoMatchingRule => {
+                warn!(method = %method, path = %path, "route check failed: no matching rule (default deny)");
+                deny("no matching route rule", "no matching route rule")
+            }
+        }
     }
 }
 
@@ -250,10 +353,28 @@ impl ServeHttp for ClearGlassProxy {
             .get(http::header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned);
+        let header = |name: &str| {
+            http_session
+                .req_header()
+                .headers
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned)
+        };
+        let fwd_method = header("x-forwarded-method");
+        let fwd_uri = header("x-forwarded-uri");
 
         match path.as_str() {
             "/healthz" => text_response(StatusCode::OK, "ok"),
-            "/validate" => self.handle_validate(auth.as_deref(), &query).await,
+            "/validate" => {
+                self.handle_validate(
+                    auth.as_deref(),
+                    &query,
+                    fwd_method.as_deref(),
+                    fwd_uri.as_deref(),
+                )
+                .await
+            }
             _ => {
                 warn!(path = %path, "request for unknown path");
                 text_response(StatusCode::NOT_FOUND, "not found")
@@ -375,6 +496,10 @@ mod tests {
 
     /// Creates a proxy with a pre-seeded JWKS cache so no HTTP request is made.
     fn make_proxy() -> ClearGlassProxy {
+        make_proxy_with_routes(None, false)
+    }
+
+    fn make_proxy_with_routes(routes_yaml: Option<&str>, enforce: bool) -> ClearGlassProxy {
         let mut cache = HashMap::new();
         cache.insert(TEST_KID.to_string(), fixture().decoding_key.clone());
         ClearGlassProxy {
@@ -386,6 +511,8 @@ mod tests {
                     .unwrap(),
                 cache: Arc::new(RwLock::new(cache)),
             }),
+            route_config: routes_yaml.map(|y| serde_yaml_ng::from_str(y).expect("routes yaml")),
+            enforce_routes: enforce,
         }
     }
 
@@ -401,21 +528,25 @@ mod tests {
 
     #[tokio::test]
     async fn no_auth_header_returns_401() {
-        let resp = make_proxy().handle_validate(None, "").await;
+        let resp = make_proxy().handle_validate(None, "", None, None).await;
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(body(&resp), "missing bearer token");
     }
 
     #[tokio::test]
     async fn wrong_auth_scheme_returns_401() {
-        let resp = make_proxy().handle_validate(Some("Basic abc123"), "").await;
+        let resp = make_proxy()
+            .handle_validate(Some("Basic abc123"), "", None, None)
+            .await;
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(body(&resp), "missing bearer token");
     }
 
     #[tokio::test]
     async fn empty_bearer_returns_401() {
-        let resp = make_proxy().handle_validate(Some("Bearer "), "").await;
+        let resp = make_proxy()
+            .handle_validate(Some("Bearer "), "", None, None)
+            .await;
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(body(&resp), "invalid bearer token");
     }
@@ -423,7 +554,9 @@ mod tests {
     #[tokio::test]
     async fn oversized_token_returns_401() {
         let tok = format!("Bearer {}", "x".repeat(4097));
-        let resp = make_proxy().handle_validate(Some(&tok), "").await;
+        let resp = make_proxy()
+            .handle_validate(Some(&tok), "", None, None)
+            .await;
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(body(&resp), "invalid bearer token");
     }
@@ -433,14 +566,16 @@ mod tests {
     #[tokio::test]
     async fn valid_jwt_no_scope_required_returns_200() {
         let tok = make_jwt("read");
-        let resp = make_proxy().handle_validate(Some(&bearer(&tok)), "").await;
+        let resp = make_proxy()
+            .handle_validate(Some(&bearer(&tok)), "", None, None)
+            .await;
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[tokio::test]
     async fn malformed_jwt_returns_401() {
         let resp = make_proxy()
-            .handle_validate(Some("Bearer not.a.jwt"), "")
+            .handle_validate(Some("Bearer not.a.jwt"), "", None, None)
             .await;
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
@@ -455,9 +590,13 @@ mod tests {
                     .build()
                     .unwrap(),
             )),
+            route_config: None,
+            enforce_routes: false,
         };
         let tok = make_jwt("read");
-        let resp = proxy.handle_validate(Some(&bearer(&tok)), "").await;
+        let resp = proxy
+            .handle_validate(Some(&bearer(&tok)), "", None, None)
+            .await;
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
@@ -482,15 +621,21 @@ mod tests {
                     .build()
                     .unwrap(),
             )),
+            route_config: None,
+            enforce_routes: false,
         };
 
         let tok = make_jwt("read");
-        let resp = proxy.handle_validate(Some(&bearer(&tok)), "").await;
+        let resp = proxy
+            .handle_validate(Some(&bearer(&tok)), "", None, None)
+            .await;
         assert_eq!(resp.status(), StatusCode::OK);
 
         // Second call must hit the cache (wiremock only registered one match).
         let tok2 = make_jwt("read");
-        let resp2 = proxy.handle_validate(Some(&bearer(&tok2)), "").await;
+        let resp2 = proxy
+            .handle_validate(Some(&bearer(&tok2)), "", None, None)
+            .await;
         assert_eq!(resp2.status(), StatusCode::OK);
     }
 
@@ -500,7 +645,7 @@ mod tests {
     async fn token_with_matching_scope_returns_200() {
         let tok = make_jwt("read write");
         let resp = make_proxy()
-            .handle_validate(Some(&bearer(&tok)), "scope=read")
+            .handle_validate(Some(&bearer(&tok)), "scope=read", None, None)
             .await;
         assert_eq!(resp.status(), StatusCode::OK);
     }
@@ -509,7 +654,7 @@ mod tests {
     async fn token_satisfying_one_of_multiple_required_scopes_returns_200() {
         let tok = make_jwt("write");
         let resp = make_proxy()
-            .handle_validate(Some(&bearer(&tok)), "scope=read&scope=write")
+            .handle_validate(Some(&bearer(&tok)), "scope=read&scope=write", None, None)
             .await;
         assert_eq!(resp.status(), StatusCode::OK);
     }
@@ -518,7 +663,7 @@ mod tests {
     async fn token_missing_required_scope_returns_403() {
         let tok = make_jwt("read");
         let resp = make_proxy()
-            .handle_validate(Some(&bearer(&tok)), "scope=admin")
+            .handle_validate(Some(&bearer(&tok)), "scope=admin", None, None)
             .await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
         assert_eq!(body(&resp), "insufficient scope");
@@ -528,7 +673,7 @@ mod tests {
     async fn empty_scope_param_value_returns_403() {
         let tok = make_jwt("");
         let resp = make_proxy()
-            .handle_validate(Some(&bearer(&tok)), "scope=")
+            .handle_validate(Some(&bearer(&tok)), "scope=", None, None)
             .await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
@@ -537,9 +682,138 @@ mod tests {
     async fn non_scope_query_params_are_ignored() {
         let tok = make_jwt("read");
         let resp = make_proxy()
-            .handle_validate(Some(&bearer(&tok)), "foo=bar&scope=read&baz=qux")
+            .handle_validate(
+                Some(&bearer(&tok)),
+                "foo=bar&scope=read&baz=qux",
+                None,
+                None,
+            )
             .await;
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // --- Route map (report-only vs enforce) ---
+
+    const ROUTES: &str = r#"
+default: deny
+routes:
+  - path: /api/identity/v1beta/participants/*/credentials/**
+    methods: [GET]
+    anyOf: [identity-api:credentials:read]
+  - path: /api/identity/v1beta/participants/**
+    methods: [POST]
+    anyOf: [identity-api:participants:write]
+"#;
+
+    #[tokio::test]
+    async fn enforce_mode_allows_matching_route_and_scope() {
+        let tok = make_jwt("identity-api:credentials:read");
+        let resp = make_proxy_with_routes(Some(ROUTES), true)
+            .handle_validate(
+                Some(&bearer(&tok)),
+                "",
+                Some("GET"),
+                Some("/api/identity/v1beta/participants/p1/credentials?type=Foo"),
+            )
+            .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn enforce_mode_allows_wider_scope_via_implication() {
+        let tok = make_jwt("identity-api:admin");
+        let resp = make_proxy_with_routes(Some(ROUTES), true)
+            .handle_validate(
+                Some(&bearer(&tok)),
+                "",
+                Some("POST"),
+                Some("/api/identity/v1beta/participants"),
+            )
+            .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn enforce_mode_denies_insufficient_scope() {
+        let tok = make_jwt("identity-api:credentials:read");
+        let resp = make_proxy_with_routes(Some(ROUTES), true)
+            .handle_validate(
+                Some(&bearer(&tok)),
+                "",
+                Some("POST"),
+                Some("/api/identity/v1beta/participants"),
+            )
+            .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(body(&resp), "insufficient scope for route");
+    }
+
+    #[tokio::test]
+    async fn enforce_mode_denies_unmatched_route() {
+        let tok = make_jwt("identity-api:admin");
+        let resp = make_proxy_with_routes(Some(ROUTES), true)
+            .handle_validate(
+                Some(&bearer(&tok)),
+                "",
+                Some("DELETE"),
+                Some("/api/unknown"),
+            )
+            .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(body(&resp), "no matching route rule");
+    }
+
+    #[tokio::test]
+    async fn enforce_mode_denies_missing_forwarded_headers() {
+        let tok = make_jwt("identity-api:admin");
+        let resp = make_proxy_with_routes(Some(ROUTES), true)
+            .handle_validate(Some(&bearer(&tok)), "", None, None)
+            .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn report_only_mode_allows_route_violations() {
+        let tok = make_jwt("identity-api:credentials:read");
+        // would be denied by the route map, but report-only only logs
+        let resp = make_proxy_with_routes(Some(ROUTES), false)
+            .handle_validate(
+                Some(&bearer(&tok)),
+                "",
+                Some("POST"),
+                Some("/api/identity/v1beta/participants"),
+            )
+            .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn report_only_mode_still_enforces_legacy_scope_params() {
+        let tok = make_jwt("identity-api:credentials:read");
+        let resp = make_proxy_with_routes(Some(ROUTES), false)
+            .handle_validate(
+                Some(&bearer(&tok)),
+                "scope=identity-api:read",
+                Some("GET"),
+                Some("/api/identity/v1beta/participants/p1/credentials"),
+            )
+            .await;
+        // legacy check is verbatim (no implication) and must keep working unchanged
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(body(&resp), "insufficient scope");
+    }
+
+    #[tokio::test]
+    async fn invalid_token_is_401_even_in_enforce_mode() {
+        let resp = make_proxy_with_routes(Some(ROUTES), true)
+            .handle_validate(
+                Some("Bearer not.a.jwt"),
+                "",
+                Some("GET"),
+                Some("/api/unknown"),
+            )
+            .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
     // --- text_response helper ---
