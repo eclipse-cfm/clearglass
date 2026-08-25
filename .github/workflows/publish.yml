@@ -94,6 +94,11 @@ jobs:
     needs:
       - build
 
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      tags: ${{ steps.meta.outputs.tags }}
+      digest: ${{ steps.manifest.outputs.digest }}
+
     steps:
       - name: "Download digests"
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -131,3 +136,58 @@ jobs:
           docker buildx imagetools create \
             $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
             $(printf '${{ env.GHCR_IMAGE }}@sha256:%s ' *)
+
+      - name: "Inspect manifest"
+        id: manifest
+        run: |
+          digest=$(docker buildx imagetools inspect \
+            "${{ env.GHCR_IMAGE }}:${{ steps.meta.outputs.version }}" \
+            --format '{{json .Manifest.Digest}}' | tr -d '"')
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+  release:
+    name: "Create GitHub Release"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    needs:
+      - merge
+
+    if: startsWith(github.ref, 'refs/tags/')
+
+    steps:
+      - name: "Checkout code"
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: "Create release"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          IMAGE_TAGS: ${{ needs.merge.outputs.tags }}
+          DIGEST: ${{ needs.merge.outputs.digest }}
+        run: |
+          notes="$(mktemp)"
+          {
+            echo "## Container images"
+            echo
+            echo '```'
+            while IFS= read -r image; do
+              [ -n "$image" ] || continue
+              echo "docker pull $image"
+            done <<< "$IMAGE_TAGS"
+            echo '```'
+            echo
+            echo "Digest: \`$DIGEST\` (linux/amd64, linux/arm64)"
+            echo
+            gh api "repos/$GITHUB_REPOSITORY/releases/generate-notes" \
+              -f tag_name="$TAG" --jq .body
+          } > "$notes"
+
+          if [[ "$TAG" == *-* ]]; then prerelease=true; else prerelease=false; fi
+
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            gh release edit "$TAG" --title "$TAG" --notes-file "$notes" --prerelease="$prerelease"
+          else
+            gh release create "$TAG" --title "$TAG" --notes-file "$notes" --prerelease="$prerelease"
+          fi
